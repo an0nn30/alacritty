@@ -16,7 +16,6 @@ flat in color_t color;
 
 #endif
 
-uniform int rectKind;
 uniform float_t cellWidth;
 uniform float_t cellHeight;
 uniform float_t paddingY;
@@ -27,12 +26,9 @@ uniform float_t underlineThickness;
 
 uniform float_t undercurlPosition;
 
-#define UNDERCURL 1
-#define DOTTED 2
-#define DASHED 3
-
 #define PI 3.1415926538
 
+#if defined(DRAW_UNDERCURL)
 color_t draw_undercurl(float_t x, float_t y) {
   // We use `undercurlPosition` as an amplitude, since it's half of the descent
   // value.
@@ -45,17 +41,24 @@ color_t draw_undercurl(float_t x, float_t y) {
   float_t undercurlTop = undercurl + max((underlineThickness - 1.), 0.) / 2.;
   float_t undercurlBottom = undercurl - max((underlineThickness - 1.), 0.) / 2.;
 
-  // Compute resulted alpha based on distance from `gl_FragCoord.y` to the
-  // cosine curve.
-  float_t alpha = 1.;
-  if (y > undercurlTop || y < undercurlBottom) {
-    alpha = 1. - min(abs(undercurlTop - y), abs(undercurlBottom - y));
-  }
+  // The distance to the curve boundary is always positive when it should
+  // be used for AA. When both `y - undercurlTop` and `undercurlBottom - y`
+  // expressions are negative, it means that the point is inside the curve
+  // and we should just use alpha 1. To do so, we max one value with 0
+  // so it'll use the alpha 1 in the end.
+  float_t dst = max(y - undercurlTop, max(undercurlBottom - y, 0.));
+
+  // Doing proper SDF is complicated for this shader, so just make AA
+  // stronger by 1/x^2, which renders preserving underline thickness and
+  // being bold enough.
+  float_t alpha = 1. - dst * dst;
 
   // The result is an alpha mask on a rect, which leaves only curve opaque.
   return vec4(color.rgb, alpha);
 }
+#endif
 
+#if defined(DRAW_DOTTED)
 // When the dot size increases we can use AA to make spacing look even and the
 // dots rounded.
 color_t draw_dotted_aliased(float_t x, float_t y) {
@@ -96,7 +99,9 @@ color_t draw_dotted(float_t x, float_t y) {
 
   return vec4(color.rgb, alpha);
 }
+#endif
 
+#if defined(DRAW_DASHED)
 color_t draw_dashed(float_t x) {
   // Since dashes of adjacent cells connect with each other our dash length is
   // half of the desired total length.
@@ -111,22 +116,23 @@ color_t draw_dashed(float_t x) {
 
   return vec4(color.rgb, alpha);
 }
+#endif
 
 void main() {
   float_t x = floor(mod(gl_FragCoord.x - paddingX, cellWidth));
   float_t y = floor(mod(gl_FragCoord.y - paddingY, cellHeight));
 
-  if (rectKind == UNDERCURL) {
-    FRAG_COLOR = draw_undercurl(x, y);
-  } else if (rectKind == DOTTED) {
-    if (underlineThickness < 2.) {
-      FRAG_COLOR = draw_dotted(x, y);
-    } else {
-      FRAG_COLOR = draw_dotted_aliased(x, y);
-    }
-  } else if (rectKind == DASHED) {
-    FRAG_COLOR = draw_dashed(x);
+#if defined(DRAW_UNDERCURL)
+  FRAG_COLOR = draw_undercurl(x, y);
+#elif defined(DRAW_DOTTED)
+  if (underlineThickness < 2.) {
+    FRAG_COLOR = draw_dotted(x, y);
   } else {
-    FRAG_COLOR = color;
+    FRAG_COLOR = draw_dotted_aliased(x, y);
   }
+#elif defined(DRAW_DASHED)
+  FRAG_COLOR = draw_dashed(x);
+#else
+  FRAG_COLOR = color;
+#endif
 }

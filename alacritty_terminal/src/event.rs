@@ -1,9 +1,10 @@
 use std::borrow::Cow;
 use std::fmt::{self, Debug, Formatter};
+use std::process::ExitStatus;
 use std::sync::Arc;
 
-use crate::term::color::Rgb;
 use crate::term::ClipboardType;
+use crate::vte::ansi::Rgb;
 
 /// Terminal event.
 ///
@@ -25,13 +26,13 @@ pub enum Event {
 
     /// Request to write the contents of the clipboard to the PTY.
     ///
-    /// The attached function is a formatter which will corectly transform the clipboard content
+    /// The attached function is a formatter which will correctly transform the clipboard content
     /// into the expected escape sequence format.
     ClipboardLoad(ClipboardType, Arc<dyn Fn(&str) -> String + Sync + Send + 'static>),
 
     /// Request to write the RGB value of a color to the PTY.
     ///
-    /// The attached function is a formatter which will corectly transform the RGB color into the
+    /// The attached function is a formatter which will correctly transform the RGB color into the
     /// expected escape sequence format.
     ColorRequest(usize, Arc<dyn Fn(Rgb) -> String + Sync + Send + 'static>),
 
@@ -52,23 +53,27 @@ pub enum Event {
 
     /// Shutdown request.
     Exit,
+
+    /// Child process exited.
+    ChildExit(ExitStatus),
 }
 
 impl Debug for Event {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Event::ClipboardStore(ty, text) => write!(f, "ClipboardStore({:?}, {})", ty, text),
-            Event::ClipboardLoad(ty, _) => write!(f, "ClipboardLoad({:?})", ty),
+            Event::ClipboardStore(ty, text) => write!(f, "ClipboardStore({ty:?}, {text})"),
+            Event::ClipboardLoad(ty, _) => write!(f, "ClipboardLoad({ty:?})"),
             Event::TextAreaSizeRequest(_) => write!(f, "TextAreaSizeRequest"),
-            Event::ColorRequest(index, _) => write!(f, "ColorRequest({})", index),
-            Event::PtyWrite(text) => write!(f, "PtyWrite({})", text),
-            Event::Title(title) => write!(f, "Title({})", title),
+            Event::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
+            Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),
+            Event::Title(title) => write!(f, "Title({title})"),
             Event::CursorBlinkingChange => write!(f, "CursorBlinkingChange"),
             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             Event::ResetTitle => write!(f, "ResetTitle"),
             Event::Wakeup => write!(f, "Wakeup"),
             Event::Bell => write!(f, "Bell"),
             Event::Exit => write!(f, "Exit"),
+            Event::ChildExit(status) => write!(f, "ChildExit({status:?})"),
         }
     }
 }

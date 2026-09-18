@@ -2,7 +2,7 @@
 
 #![warn(rust_2018_idioms, future_incompatible)]
 #![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
-#![cfg_attr(feature = "cargo-clippy", deny(warnings))]
+#![cfg_attr(clippy, deny(warnings))]
 // With the default subsystem, 'console', windows creates an additional console
 // window for the program.
 // This is silently ignored on non-windows systems.
@@ -12,20 +12,18 @@
 #[cfg(not(any(feature = "x11", feature = "wayland", target_os = "macos", windows)))]
 compile_error!(r#"at least one of the "x11"/"wayland" features must be enabled"#);
 
-#[cfg(target_os = "macos")]
-use std::env;
 use std::error::Error;
 use std::fmt::Write as _;
-use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::{env, fs};
 
-use glutin::event_loop::EventLoopBuilder as GlutinEventLoopBuilder;
-#[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
-use glutin::platform::unix::EventLoopWindowTargetExtUnix;
 use log::info;
 #[cfg(windows)]
-use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, ATTACH_PARENT_PROCESS};
+use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, FreeConsole};
+use winit::event_loop::EventLoop;
+#[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
+use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 
 use alacritty_terminal::tty;
 
@@ -36,31 +34,37 @@ mod daemon;
 mod display;
 mod event;
 mod input;
-#[cfg(unix)]
-mod ipc;
 mod logging;
 #[cfg(target_os = "macos")]
 mod macos;
 mod message_bar;
+mod migrate;
 #[cfg(windows)]
 mod panic;
+#[cfg(unix)]
+mod polling;
 mod renderer;
 mod scheduler;
 mod string;
 mod window_context;
 
 mod gl {
-    #![allow(clippy::all)]
+    #![allow(clippy::all, unsafe_op_in_unsafe_fn)]
     include!(concat!(env!("OUT_DIR"), "/gl_bindings.rs"));
 }
 
-use crate::cli::Options;
 #[cfg(unix)]
-use crate::cli::{MessageOptions, Subcommands};
-use crate::config::{monitor, UiConfig};
+use crate::cli::MessageOptions;
+#[cfg(not(any(target_os = "macos", windows)))]
+use crate::cli::SocketMessage;
+use crate::cli::{Options, Subcommands};
+use crate::config::UiConfig;
+use crate::config::monitor::ConfigMonitor;
 use crate::event::{Event, Processor};
 #[cfg(target_os = "macos")]
 use crate::macos::locale;
+#[cfg(unix)]
+use crate::polling::{IoListener, ipc};
 
 fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(windows)]
@@ -77,19 +81,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Load command line options.
     let options = Options::new();
 
-    #[cfg(unix)]
     match options.subcommands {
-        Some(Subcommands::Msg(options)) => msg(options),
-        None => alacritty(options),
+        #[cfg(unix)]
+        Some(Subcommands::Msg(options)) => msg(options)?,
+        Some(Subcommands::Migrate(options)) => migrate::migrate(options),
+        None => alacritty(options)?,
     }
 
-    #[cfg(not(unix))]
-    alacritty(options)
+    Ok(())
 }
 
 /// `msg` subcommand entrypoint.
 #[cfg(unix)]
-fn msg(options: MessageOptions) -> Result<(), Box<dyn Error>> {
+#[allow(unused_mut)]
+fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
+    #[cfg(not(any(target_os = "macos", windows)))]
+    if let SocketMessage::CreateWindow(window_options) = &mut options.message {
+        window_options.activation_token =
+            env::var("XDG_ACTIVATION_TOKEN").or_else(|_| env::var("DESKTOP_STARTUP_ID")).ok();
+    }
     ipc::send_message(options.socket, options.message).map_err(|err| err.into())
 }
 
@@ -106,7 +116,7 @@ impl Drop for TemporaryFiles {
     fn drop(&mut self) {
         // Clean up the IPC socket file.
         #[cfg(unix)]
-        if let Some(socket_path) = &self.socket_path {
+        if let Some(socket_path) = self.socket_path.as_deref() {
             let _ = fs::remove_file(socket_path);
         }
 
@@ -123,9 +133,9 @@ impl Drop for TemporaryFiles {
 ///
 /// Creates a window, the terminal state, PTY, I/O event loop, input processor,
 /// config change monitor, and runs the main display loop.
-fn alacritty(options: Options) -> Result<(), Box<dyn Error>> {
-    // Setup glutin event loop.
-    let window_event_loop = GlutinEventLoopBuilder::<Event>::with_user_event().build();
+fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
+    // Setup winit event loop.
+    let window_event_loop = EventLoop::<Event>::with_user_event().build()?;
 
     // Initialize the logger as soon as possible as to capture output from other subsystems.
     let log_file = logging::initialize(&options, window_event_loop.create_proxy())
@@ -135,42 +145,55 @@ fn alacritty(options: Options) -> Result<(), Box<dyn Error>> {
     info!("Version {}", env!("VERSION"));
 
     #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
-    info!("Running on {}", if window_event_loop.is_x11() { "X11" } else { "Wayland" });
+    info!(
+        "Running on {}",
+        if matches!(
+            window_event_loop.display_handle().unwrap().as_raw(),
+            RawDisplayHandle::Wayland(_)
+        ) {
+            "Wayland"
+        } else {
+            "X11"
+        }
+    );
     #[cfg(not(any(feature = "x11", target_os = "macos", windows)))]
     info!("Running on Wayland");
 
     // Load configuration file.
-    let config = config::load(&options);
+    let config = config::load(&mut options);
     log_config_path(&config);
 
     // Update the log level from config.
     log::set_max_level(config.debug.log_level);
 
-    // Set environment variables.
-    tty::setup_env(&config.terminal_config);
+    // Set tty environment variables.
+    tty::setup_env();
+
+    // Set env vars from config.
+    for (key, value) in config.env.iter() {
+        unsafe { env::set_var(key, value) };
+    }
 
     // Switch to home directory.
     #[cfg(target_os = "macos")]
-    env::set_current_dir(dirs::home_dir().unwrap()).unwrap();
+    env::set_current_dir(home::home_dir().unwrap()).unwrap();
 
     // Set macOS locale.
     #[cfg(target_os = "macos")]
     locale::set_locale_environment();
 
-    // Create a config monitor when config was loaded from path.
-    //
-    // The monitor watches the config file for changes and reloads it. Pending
-    // config changes are processed in the main loop.
-    if config.live_config_reload {
-        monitor::watch(config.config_paths.clone(), window_event_loop.create_proxy());
-    }
+    #[cfg(target_os = "macos")]
+    macos::disable_autofill();
 
-    // Create the IPC socket listener.
+    // Spawn the Unix I/O event polling thread.
     #[cfg(unix)]
-    let socket_path = if config.ipc_socket {
-        ipc::spawn_ipc_socket(&options, window_event_loop.create_proxy())
-    } else {
-        None
+    let socket_path = match IoListener::spawn(&config, &options, window_event_loop.create_proxy()) {
+        Ok(handle) => handle.ipc_socket_path,
+        Err(err) if options.daemon => return Err(err.into()),
+        Err(err) => {
+            log::warn!("Unable to create socket: {err:?}");
+            None
+        },
     };
 
     // Setup automatic RAII cleanup for our files.
@@ -182,13 +205,14 @@ fn alacritty(options: Options) -> Result<(), Box<dyn Error>> {
     };
 
     // Event processor.
-    let window_options = options.window_options.clone();
     let mut processor = Processor::new(config, options, &window_event_loop);
 
     // Start event loop and block until shutdown.
-    let result = processor.run(window_event_loop, window_options);
+    let result = processor.run(window_event_loop);
 
-    // This explicit drop is needed for Windows, ConPTY backend. Otherwise a deadlock can occur.
+    // `Processor` must be dropped before calling `FreeConsole`.
+    //
+    // This is needed for ConPTY backend. Otherwise a deadlock can occur.
     // The cause:
     //   - Drop for ConPTY will deadlock if the conout pipe has already been dropped
     //   - ConPTY is dropped when the last of processor and window context are dropped, because both
@@ -199,10 +223,11 @@ fn alacritty(options: Options) -> Result<(), Box<dyn Error>> {
     // order.
     //
     // FIXME: Change PTY API to enforce the correct drop order with the typesystem.
-    drop(processor);
 
-    // FIXME patch notify library to have a shutdown method.
-    // config_reloader.join().ok();
+    // Terminate the config monitor.
+    if let Some(config_monitor) = processor.config_monitor.take() {
+        config_monitor.shutdown();
+    }
 
     // Without explicitly detaching the console cmd won't redraw it's prompt.
     #[cfg(windows)]
@@ -225,5 +250,5 @@ fn log_config_path(config: &UiConfig) {
         let _ = write!(msg, "\n  {:?}", path.display());
     }
 
-    info!("{}", msg);
+    info!("{msg}");
 }

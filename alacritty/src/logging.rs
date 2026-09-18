@@ -8,35 +8,56 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, LineWriter, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use std::{env, process};
 
-use glutin::event_loop::EventLoopProxy;
-use log::{self, Level, LevelFilter};
-
-use alacritty_terminal::config::LOG_TARGET_CONFIG;
+use log::{Level, LevelFilter};
+use winit::event_loop::EventLoopProxy;
 
 use crate::cli::Options;
 use crate::event::{Event, EventType};
 use crate::message_bar::{Message, MessageType};
 
 /// Logging target for IPC config error messages.
-pub const LOG_TARGET_IPC_CONFIG: &str = "alacritty_log_ipc_config";
+pub const LOG_TARGET_IPC_CONFIG: &str = "alacritty_log_window_config";
 
 /// Name for the environment variable containing the log file's path.
 const ALACRITTY_LOG_ENV: &str = "ALACRITTY_LOG";
+
+/// Logging target for config error messages.
+pub const LOG_TARGET_CONFIG: &str = "alacritty_config_derive";
+
+/// Logging target for winit events.
+pub const LOG_TARGET_WINIT: &str = "alacritty_winit_event";
+
+/// Name for the environment variable containing extra logging targets.
+///
+/// The targets are semicolon separated.
+const ALACRITTY_EXTRA_LOG_TARGETS_ENV: &str = "ALACRITTY_EXTRA_LOG_TARGETS";
+
+/// User configurable extra log targets to include.
+fn extra_log_targets() -> &'static [String] {
+    static EXTRA_LOG_TARGETS: OnceLock<Vec<String>> = OnceLock::new();
+
+    EXTRA_LOG_TARGETS.get_or_init(|| {
+        env::var(ALACRITTY_EXTRA_LOG_TARGETS_ENV)
+            .map_or(Vec::new(), |targets| targets.split(';').map(ToString::to_string).collect())
+    })
+}
 
 /// List of targets which will be logged by Alacritty.
 const ALLOWED_TARGETS: &[&str] = &[
     LOG_TARGET_IPC_CONFIG,
     LOG_TARGET_CONFIG,
+    LOG_TARGET_WINIT,
     "alacritty_config_derive",
     "alacritty_terminal",
     "alacritty",
     "crossfont",
 ];
 
+/// Initialize the logger to its defaults.
 pub fn initialize(
     options: &Options,
     event_proxy: EventLoopProxy<Event>,
@@ -66,11 +87,8 @@ impl Logger {
     }
 
     fn file_path(&self) -> Option<PathBuf> {
-        if let Ok(logfile) = self.logfile.lock() {
-            Some(logfile.path().clone())
-        } else {
-            None
-        }
+        let logfile_lock = self.logfile.lock().ok()?;
+        Some(logfile_lock.path().clone())
     }
 
     /// Log a record to the message bar.
@@ -87,16 +105,16 @@ impl Logger {
         };
 
         #[cfg(not(windows))]
-        let env_var = format!("${}", ALACRITTY_LOG_ENV);
+        let env_var = format!("${ALACRITTY_LOG_ENV}");
         #[cfg(windows)]
         let env_var = format!("%{}%", ALACRITTY_LOG_ENV);
 
         let message = format!(
-            "[{}] See log at {} ({}):\n{}",
+            "[{}] {}\nSee log at {} ({})",
             record.level(),
+            record.args(),
             logfile_path,
             env_var,
-            record.args(),
         );
 
         let mut message = Message::new(message, message_type);
@@ -167,7 +185,7 @@ fn create_log_message(record: &log::Record<'_>, target: &str, start: Instant) ->
 fn is_allowed_target(level: Level, target: &str) -> bool {
     match (level, log::max_level()) {
         (Level::Error, LevelFilter::Trace) | (Level::Warn, LevelFilter::Trace) => true,
-        _ => ALLOWED_TARGETS.contains(&target),
+        _ => ALLOWED_TARGETS.contains(&target) || extra_log_targets().iter().any(|t| t == target),
     }
 }
 
@@ -183,7 +201,7 @@ impl OnDemandLogFile {
         path.push(format!("Alacritty-{}.log", process::id()));
 
         // Set log path as an environment variable.
-        env::set_var(ALACRITTY_LOG_ENV, path.as_os_str());
+        unsafe { env::set_var(ALACRITTY_LOG_ENV, path.as_os_str()) };
 
         OnDemandLogFile { path, file: None, created: Arc::new(AtomicBool::new(false)) }
     }
@@ -206,7 +224,7 @@ impl OnDemandLogFile {
                         writeln!(io::stdout(), "Created log file at \"{}\"", self.path.display());
                 },
                 Err(e) => {
-                    let _ = writeln!(io::stdout(), "Unable to create log file: {}", e);
+                    let _ = writeln!(io::stdout(), "Unable to create log file: {e}");
                     return Err(e);
                 },
             }

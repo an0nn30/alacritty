@@ -1,21 +1,29 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
-use std::ffi::CStr;
-use std::fmt;
+use std::ffi::{CStr, CString};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{fmt, ptr};
 
+use ahash::RandomState;
 use crossfont::Metrics;
-use log::info;
-use once_cell::sync::OnceCell;
+use glutin::context::{ContextApi, GlContext, PossiblyCurrentContext};
+use glutin::display::{GetGlDisplay, GlDisplay};
+use log::{LevelFilter, debug, info};
+use unicode_width::UnicodeWidthChar;
 
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::color::Rgb;
 
-use crate::display::content::RenderableCell;
+use crate::config::debug::RendererPreference;
 use crate::display::SizeInfo;
+use crate::display::color::Rgb;
+use crate::display::content::RenderableCell;
 use crate::gl;
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
 
+pub mod platform;
 pub mod rects;
 mod shader;
 mod text;
@@ -25,24 +33,23 @@ pub use text::{GlyphCache, LoaderApi};
 use shader::ShaderVersion;
 use text::{Gles2Renderer, Glsl3Renderer, TextRenderer};
 
-macro_rules! cstr {
-    ($s:literal) => {
-        // This can be optimized into an no-op with pre-allocated NUL-terminated bytes.
-        unsafe { std::ffi::CStr::from_ptr(concat!($s, "\0").as_ptr().cast()) }
-    };
-}
-pub(crate) use cstr;
+/// Whether the OpenGL functions have been loaded.
+pub static GL_FUNS_LOADED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 pub enum Error {
     /// Shader error.
     Shader(ShaderError),
+
+    /// Other error.
+    Other(String),
 }
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Shader(err) => err.source(),
+            Error::Other(_) => None,
         }
     }
 }
@@ -51,7 +58,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Shader(err) => {
-                write!(f, "There was an error initializing the shaders: {}", err)
+                write!(f, "There was an error initializing the shaders: {err}")
+            },
+            Error::Other(err) => {
+                write!(f, "{err}")
             },
         }
     }
@@ -60,6 +70,12 @@ impl fmt::Display for Error {
 impl From<ShaderError> for Error {
     fn from(val: ShaderError) -> Self {
         Error::Shader(val)
+    }
+}
+
+impl From<String> for Error {
+    fn from(val: String) -> Self {
+        Error::Other(val)
     }
 }
 
@@ -73,6 +89,26 @@ enum TextRendererProvider {
 pub struct Renderer {
     text_renderer: TextRendererProvider,
     rect_renderer: RectRenderer,
+    robustness: bool,
+}
+
+/// Wrapper around gl::GetString with error checking and reporting.
+fn gl_get_string(
+    string_id: gl::types::GLenum,
+    description: &str,
+) -> Result<Cow<'static, str>, Error> {
+    unsafe {
+        let string_ptr = gl::GetString(string_id);
+        match gl::GetError() {
+            gl::NO_ERROR if !string_ptr.is_null() => {
+                Ok(CStr::from_ptr(string_ptr as *const _).to_string_lossy())
+            },
+            gl::INVALID_ENUM => {
+                Err(format!("OpenGL error requesting {description}: invalid enum").into())
+            },
+            error_id => Err(format!("OpenGL error {error_id} requesting {description}").into()),
+        }
+    }
 }
 
 impl Renderer {
@@ -80,26 +116,62 @@ impl Renderer {
     ///
     /// This will automatically pick between the GLES2 and GLSL3 renderer based on the GPU's
     /// supported OpenGL version.
-    pub fn new() -> Result<Self, Error> {
-        let (version, renderer) = unsafe {
-            let renderer = CStr::from_ptr(gl::GetString(gl::RENDERER) as *mut _);
-            let version = CStr::from_ptr(gl::GetString(gl::SHADING_LANGUAGE_VERSION) as *mut _);
-            (version.to_string_lossy(), renderer.to_string_lossy())
+    pub fn new(
+        context: &PossiblyCurrentContext,
+        renderer_preference: Option<RendererPreference>,
+    ) -> Result<Self, Error> {
+        // We need to load OpenGL functions once per instance, but only after we make our context
+        // current due to WGL limitations.
+        if !GL_FUNS_LOADED.swap(true, Ordering::Relaxed) {
+            let gl_display = context.display();
+            gl::load_with(|symbol| {
+                let symbol = CString::new(symbol).unwrap();
+                gl_display.get_proc_address(symbol.as_c_str()).cast()
+            });
+        }
+
+        let shader_version = gl_get_string(gl::SHADING_LANGUAGE_VERSION, "shader version")?;
+        let gl_version = gl_get_string(gl::VERSION, "OpenGL version")?;
+        let renderer = gl_get_string(gl::RENDERER, "renderer version")?;
+
+        info!("Running on {renderer}");
+        info!("OpenGL version {gl_version}, shader_version {shader_version}");
+
+        // Check if robustness is supported.
+        let robustness = Self::supports_robustness();
+
+        let is_gles_context = matches!(context.context_api(), ContextApi::Gles(_));
+
+        // Use the config option to enforce a particular renderer configuration.
+        let (use_glsl3, allow_dsb) = match renderer_preference {
+            Some(RendererPreference::Glsl3) => (true, true),
+            Some(RendererPreference::Gles2) => (false, true),
+            Some(RendererPreference::Gles2Pure) => (false, false),
+            None => (shader_version.as_ref() >= "3.3" && !is_gles_context, true),
         };
 
-        info!("Running on {}", renderer);
-
-        let (text_renderer, rect_renderer) = if version.as_ref() >= "3.3" {
+        let (text_renderer, rect_renderer) = if use_glsl3 {
             let text_renderer = TextRendererProvider::Glsl3(Glsl3Renderer::new()?);
             let rect_renderer = RectRenderer::new(ShaderVersion::Glsl3)?;
             (text_renderer, rect_renderer)
         } else {
-            let text_renderer = TextRendererProvider::Gles2(Gles2Renderer::new()?);
+            let text_renderer =
+                TextRendererProvider::Gles2(Gles2Renderer::new(allow_dsb, is_gles_context)?);
             let rect_renderer = RectRenderer::new(ShaderVersion::Gles2)?;
             (text_renderer, rect_renderer)
         };
 
-        Ok(Self { text_renderer, rect_renderer })
+        // Enable debug logging for OpenGL as well.
+        if log::max_level() >= LevelFilter::Debug && GlExtensions::contains("GL_KHR_debug") {
+            debug!("Enabled debug logging for OpenGL");
+            unsafe {
+                gl::Enable(gl::DEBUG_OUTPUT);
+                gl::Enable(gl::DEBUG_OUTPUT_SYNCHRONOUS);
+                gl::DebugMessageCallback(Some(gl_debug_log), ptr::null_mut());
+            }
+        }
+
+        Ok(Self { text_renderer, rect_renderer, robustness })
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
@@ -129,15 +201,29 @@ impl Renderer {
         size_info: &SizeInfo,
         glyph_cache: &mut GlyphCache,
     ) {
-        let cells = string_chars.enumerate().map(|(i, character)| RenderableCell {
-            point: Point::new(point.line, point.column + i),
-            character,
-            extra: None,
-            flags: Flags::empty(),
-            bg_alpha: 1.0,
-            fg,
-            bg,
-            underline: fg,
+        let mut wide_char_spacer = false;
+        let cells = string_chars.enumerate().filter_map(|(i, character)| {
+            let flags = if wide_char_spacer {
+                wide_char_spacer = false;
+                return None;
+            } else if character.width() == Some(2) {
+                // The spacer is always following the wide char.
+                wide_char_spacer = true;
+                Flags::WIDE_CHAR
+            } else {
+                Flags::empty()
+            };
+
+            Some(RenderableCell {
+                point: Point::new(point.line, point.column + i),
+                character,
+                extra: None,
+                flags,
+                bg_alpha: 1.0,
+                fg,
+                bg,
+                underline: fg,
+            })
         });
 
         self.draw_cells(size_info, glyph_cache, cells);
@@ -191,7 +277,49 @@ impl Renderer {
         }
     }
 
-    #[cfg(not(any(target_os = "macos", windows)))]
+    /// Get the context reset status.
+    pub fn was_context_reset(&self) -> bool {
+        // If robustness is not supported, don't use its functions.
+        if !self.robustness {
+            return false;
+        }
+
+        let status = unsafe { gl::GetGraphicsResetStatus() };
+        if status == gl::NO_ERROR {
+            false
+        } else {
+            let reason = match status {
+                gl::GUILTY_CONTEXT_RESET_KHR => "guilty",
+                gl::INNOCENT_CONTEXT_RESET_KHR => "innocent",
+                gl::UNKNOWN_CONTEXT_RESET_KHR => "unknown",
+                _ => "invalid",
+            };
+
+            info!("GPU reset ({reason})");
+
+            true
+        }
+    }
+
+    fn supports_robustness() -> bool {
+        let mut notification_strategy = 0;
+        if GlExtensions::contains("GL_KHR_robustness") {
+            unsafe {
+                gl::GetIntegerv(gl::RESET_NOTIFICATION_STRATEGY_KHR, &mut notification_strategy);
+            }
+        } else {
+            notification_strategy = gl::NO_RESET_NOTIFICATION_KHR as gl::types::GLint;
+        }
+
+        if notification_strategy == gl::LOSE_CONTEXT_ON_RESET_KHR as gl::types::GLint {
+            info!("GPU reset notifications are enabled");
+            true
+        } else {
+            info!("GPU reset notifications are disabled");
+            false
+        }
+    }
+
     pub fn finish(&self) {
         unsafe {
             gl::Finish();
@@ -226,15 +354,15 @@ struct GlExtensions;
 impl GlExtensions {
     /// Check if the given `extension` is supported.
     ///
-    /// This function will lazyly load OpenGL extensions.
+    /// This function will lazily load OpenGL extensions.
     fn contains(extension: &str) -> bool {
-        static OPENGL_EXTENSIONS: OnceCell<HashSet<&'static str>> = OnceCell::new();
+        static OPENGL_EXTENSIONS: OnceLock<HashSet<&'static str, RandomState>> = OnceLock::new();
 
         OPENGL_EXTENSIONS.get_or_init(Self::load_extensions).contains(extension)
     }
 
     /// Load available OpenGL extensions.
-    fn load_extensions() -> HashSet<&'static str> {
+    fn load_extensions() -> HashSet<&'static str, RandomState> {
         unsafe {
             let extensions = gl::GetString(gl::EXTENSIONS);
 
@@ -251,9 +379,22 @@ impl GlExtensions {
             } else {
                 match CStr::from_ptr(extensions as *mut _).to_str() {
                     Ok(ext) => ext.split_whitespace().collect(),
-                    Err(_) => HashSet::new(),
+                    Err(_) => Default::default(),
                 }
             }
         }
     }
+}
+
+extern "system" fn gl_debug_log(
+    _: gl::types::GLenum,
+    _: gl::types::GLenum,
+    _: gl::types::GLuint,
+    _: gl::types::GLenum,
+    _: gl::types::GLsizei,
+    msg: *const gl::types::GLchar,
+    _: *mut std::os::raw::c_void,
+) {
+    let msg = unsafe { CStr::from_ptr(msg).to_string_lossy() };
+    debug!("[gl_render] {msg}");
 }

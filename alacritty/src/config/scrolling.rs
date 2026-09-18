@@ -1,5 +1,5 @@
 use serde::de::Error as SerdeError;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
 
@@ -7,7 +7,7 @@ use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
 pub const MAX_SCROLLBACK_LINES: u32 = 100_000;
 
 /// Struct for scrolling related settings.
-#[derive(ConfigDeserialize, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(ConfigDeserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Scrolling {
     pub multiplier: u8,
 
@@ -24,14 +24,9 @@ impl Scrolling {
     pub fn history(self) -> u32 {
         self.history.0
     }
-
-    // Update the history size, used in ref tests.
-    pub fn set_history(&mut self, history: u32) {
-        self.history = ScrollingHistory(history);
-    }
 }
 
-#[derive(SerdeReplace, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(SerdeReplace, Serialize, Copy, Clone, Debug, PartialEq, Eq)]
 struct ScrollingHistory(u32);
 
 impl Default for ScrollingHistory {
@@ -49,8 +44,7 @@ impl<'de> Deserialize<'de> for ScrollingHistory {
 
         if lines > MAX_SCROLLBACK_LINES {
             Err(SerdeError::custom(format!(
-                "exceeded maximum scrolling history ({}/{})",
-                lines, MAX_SCROLLBACK_LINES
+                "exceeded maximum scrolling history ({lines}/{MAX_SCROLLBACK_LINES})"
             )))
         } else {
             Ok(Self(lines))

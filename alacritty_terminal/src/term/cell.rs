@@ -1,15 +1,24 @@
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
+use arrayvec::ArrayVec;
 use bitflags::bitflags;
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::ansi::{Color, NamedColor};
 use crate::grid::{self, GridCell};
 use crate::index::Column;
+use crate::vte::ansi::{Color, Hyperlink as VteHyperlink, NamedColor};
+
+/// Maximum number of zerowidth characters to retain per grid cell.
+///
+/// This enforces an upper bound on memory usage per cell, to ensure
+/// malicous applications cannot use this as a DoS vector.
+const MAX_ZEROWIDTH_CHARS: usize = 9;
 
 bitflags! {
-    #[derive(Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct Flags: u16 {
         const INVERSE                   = 0b0000_0000_0000_0001;
         const BOLD                      = 0b0000_0000_0000_0010;
@@ -28,22 +37,23 @@ bitflags! {
         const UNDERCURL                 = 0b0001_0000_0000_0000;
         const DOTTED_UNDERLINE          = 0b0010_0000_0000_0000;
         const DASHED_UNDERLINE          = 0b0100_0000_0000_0000;
-        const ALL_UNDERLINES            = Self::UNDERLINE.bits | Self::DOUBLE_UNDERLINE.bits
-                                        | Self::UNDERCURL.bits | Self::DOTTED_UNDERLINE.bits
-                                        | Self::DASHED_UNDERLINE.bits;
+        const ALL_UNDERLINES            = Self::UNDERLINE.bits() | Self::DOUBLE_UNDERLINE.bits()
+                                        | Self::UNDERCURL.bits() | Self::DOTTED_UNDERLINE.bits()
+                                        | Self::DASHED_UNDERLINE.bits();
     }
 }
 
 /// Counter for hyperlinks without explicit ID.
 static HYPERLINK_ID_SUFFIX: AtomicU32 = AtomicU32::new(0);
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Hyperlink {
     inner: Arc<HyperlinkInner>,
 }
 
 impl Hyperlink {
-    pub fn new<T: ToString>(id: Option<T>, uri: T) -> Self {
+    pub fn new<T: ToString>(id: Option<T>, uri: String) -> Self {
         let inner = Arc::new(HyperlinkInner::new(id, uri));
         Self { inner }
     }
@@ -57,7 +67,20 @@ impl Hyperlink {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
+impl From<VteHyperlink> for Hyperlink {
+    fn from(value: VteHyperlink) -> Self {
+        Self::new(value.id, value.uri)
+    }
+}
+
+impl From<Hyperlink> for VteHyperlink {
+    fn from(val: Hyperlink) -> Self {
+        VteHyperlink { id: Some(val.id().to_owned()), uri: val.uri().to_owned() }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 struct HyperlinkInner {
     /// Identifier for the given hyperlink.
     id: String,
@@ -67,7 +90,7 @@ struct HyperlinkInner {
 }
 
 impl HyperlinkInner {
-    pub fn new<T: ToString>(id: Option<T>, uri: T) -> Self {
+    pub fn new<T: ToString>(id: Option<T>, uri: String) -> Self {
         let id = match id {
             Some(id) => id.to_string(),
             None => {
@@ -77,7 +100,7 @@ impl HyperlinkInner {
             },
         };
 
-        Self { id, uri: uri.to_string() }
+        Self { id, uri }
     }
 }
 
@@ -104,17 +127,17 @@ impl ResetDiscriminant<Color> for Cell {
 /// This storage is reserved for cell attributes which are rarely set. This allows reducing the
 /// allocation required ahead of time for every cell, with some additional overhead when the extra
 /// storage is actually required.
-#[derive(Serialize, Deserialize, Default, Debug, Clone, Eq, PartialEq)]
+#[derive(Default, Debug, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CellExtra {
-    zerowidth: Vec<char>,
-
+    zerowidth: ArrayVec<char, MAX_ZEROWIDTH_CHARS>,
     underline_color: Option<Color>,
-
     hyperlink: Option<Hyperlink>,
 }
 
 /// Content and attributes of a single cell in the terminal grid.
-#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Cell {
     pub c: char,
     pub fg: Color,
@@ -147,7 +170,7 @@ impl Cell {
     #[inline]
     pub fn push_zerowidth(&mut self, character: char) {
         let extra = self.extra.get_or_insert(Default::default());
-        Arc::make_mut(extra).zerowidth.push(character);
+        let _ = Arc::make_mut(extra).zerowidth.try_push(character);
     }
 
     /// Remove all wide char data from a cell.
@@ -155,7 +178,7 @@ impl Cell {
     pub fn clear_wide(&mut self) {
         self.flags.remove(Flags::WIDE_CHAR);
         if let Some(extra) = self.extra.as_mut() {
-            Arc::make_mut(extra).zerowidth = Vec::new();
+            Arc::make_mut(extra).zerowidth = ArrayVec::new();
         }
         self.c = ' ';
     }
@@ -167,7 +190,7 @@ impl Cell {
             && self
                 .extra
                 .as_ref()
-                .map_or(true, |extra| extra.zerowidth.is_empty() && extra.hyperlink.is_none())
+                .is_none_or(|extra| extra.zerowidth.is_empty() && extra.hyperlink.is_none())
         {
             self.extra = None;
         } else {
@@ -185,9 +208,10 @@ impl Cell {
     /// Set hyperlink.
     pub fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
         let should_drop = hyperlink.is_none()
-            && self.extra.as_ref().map_or(true, |extra| {
-                extra.zerowidth.is_empty() && extra.underline_color.is_none()
-            });
+            && self
+                .extra
+                .as_ref()
+                .is_none_or(|extra| extra.zerowidth.is_empty() && extra.underline_color.is_none());
 
         if should_drop {
             self.extra = None;
@@ -285,7 +309,7 @@ mod tests {
         // Expected cell size on 64-bit architectures.
         const EXPECTED_CELL_SIZE: usize = 24;
 
-        // Ensure that cell size isn't growning by accident.
+        // Ensure that cell size isn't growing by accident.
         assert!(mem::size_of::<Cell>() <= EXPECTED_CELL_SIZE);
     }
 

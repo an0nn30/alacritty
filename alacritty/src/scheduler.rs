@@ -3,8 +3,8 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use glutin::event_loop::EventLoopProxy;
-use glutin::window::WindowId;
+use winit::event_loop::EventLoopProxy;
+use winit::window::WindowId;
 
 use crate::event::Event;
 
@@ -28,6 +28,7 @@ pub enum Topic {
     DelayedSearch,
     BlinkCursor,
     BlinkTimeout,
+    Frame,
 }
 
 /// Event scheduled to be emitted at a specific time.
@@ -68,7 +69,7 @@ impl Scheduler {
             }
         }
 
-        self.timers.get(0).map(|timer| timer.deadline)
+        self.timers.front().map(|timer| timer.deadline)
     }
 
     /// Schedule a new event.
@@ -80,7 +81,7 @@ impl Scheduler {
             .timers
             .iter()
             .position(|timer| timer.deadline > deadline)
-            .unwrap_or_else(|| self.timers.len());
+            .unwrap_or(self.timers.len());
 
         // Set the automatic event repeat rate.
         let interval = if repeat { Some(interval) } else { None };

@@ -1,5 +1,4 @@
-//! Hand-rolled drawing of unicode [box drawing](http://www.unicode.org/charts/PDF/U2500.pdf)
-//! and [block elements](https://www.unicode.org/charts/PDF/U2580.pdf).
+//! Hand-rolled drawing of unicode characters that need to fully cover their character area.
 
 use std::{cmp, mem, ops};
 
@@ -15,6 +14,11 @@ const COLOR_FILL_ALPHA_STEP_3: Pixel = Pixel { _r: 64, _g: 64, _b: 64 };
 /// Default color used for filling.
 const COLOR_FILL: Pixel = Pixel { _r: 255, _g: 255, _b: 255 };
 
+const POWERLINE_TRIANGLE_LTR: char = '\u{e0b0}';
+const POWERLINE_ARROW_LTR: char = '\u{e0b1}';
+const POWERLINE_TRIANGLE_RTL: char = '\u{e0b2}';
+const POWERLINE_ARROW_RTL: char = '\u{e0b3}';
+
 /// Returns the rasterized glyph if the character is part of the built-in font.
 pub fn builtin_glyph(
     character: char,
@@ -24,7 +28,13 @@ pub fn builtin_glyph(
 ) -> Option<RasterizedGlyph> {
     let mut glyph = match character {
         // Box drawing characters and block elements.
-        '\u{2500}'..='\u{259f}' => box_drawing(character, metrics, offset),
+        '\u{2500}'..='\u{259f}' | '\u{1fb00}'..='\u{1fb3b}' | '\u{1fb82}'..='\u{1fb8b}' => {
+            box_drawing(character, metrics, offset)
+        },
+        // Powerline symbols: '','','',''
+        POWERLINE_TRIANGLE_LTR..=POWERLINE_ARROW_RTL => {
+            powerline_drawing(character, metrics, offset)?
+        },
         _ => return None,
     };
 
@@ -37,10 +47,10 @@ pub fn builtin_glyph(
 }
 
 fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> RasterizedGlyph {
-    let height = (metrics.line_height as i32 + offset.y as i32) as usize;
-    let width = (metrics.average_advance as i32 + offset.x as i32) as usize;
-    // Use one eight of the cell width, since this is used as a step size for block elemenets.
-    let stroke_size = cmp::max((width as f32 / 8.).round() as usize, 1);
+    // Ensure that width and height is at least one.
+    let height = (metrics.line_height as i32 + offset.y as i32).max(1) as usize;
+    let width = (metrics.average_advance as i32 + offset.x as i32).max(1) as usize;
+    let stroke_size = calculate_stroke_size(width);
     let heavy_stroke_size = stroke_size * 2;
 
     // Certain symbols require larger canvas than the cell itself, since for proper contiguous
@@ -63,7 +73,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
             y_end += y_offset;
 
             let k = y_end / x_end;
-            let f_x = |x: f32, h: f32| -> f32 { -1. * k * x + h + y_offset };
+            let f_x = |x: f32, h: f32| -> f32 { -k * x + h + y_offset };
             let g_x = |x: f32, h: f32| -> f32 { k * x + h + y_offset };
 
             let from_x = 0.;
@@ -339,7 +349,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
         },
         // Arcs: '╭', '╮', '╯', '╰'.
         '\u{256d}' | '\u{256e}' | '\u{256f}' | '\u{2570}' => {
-            canvas.draw_ellipse_arc(stroke_size);
+            canvas.draw_rounded_corner(stroke_size);
 
             // Mirror `X` axis.
             if character == '\u{256d}' || character == '\u{2570}' {
@@ -382,17 +392,21 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
             }
         },
         // Parts of full block: '▀', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '▔', '▉', '▊', '▋', '▌',
-        // '▍', '▎', '▏', '▐', '▕'.
-        '\u{2580}'..='\u{2587}' | '\u{2589}'..='\u{2590}' | '\u{2594}' | '\u{2595}' => {
+        // '▍', '▎', '▏', '▐', '▕', '🮂', '🮃', '🮄', '🮅', '🮆', '🮇', '🮈', '🮉', '🮊', '🮋'.
+        '\u{2580}'..='\u{2587}'
+        | '\u{2589}'..='\u{2590}'
+        | '\u{2594}'
+        | '\u{2595}'
+        | '\u{1fb82}'..='\u{1fb8b}' => {
             let width = width as f32;
             let height = height as f32;
             let mut rect_width = match character {
-                '\u{2589}' => width * 7. / 8.,
-                '\u{258a}' => width * 6. / 8.,
-                '\u{258b}' => width * 5. / 8.,
+                '\u{2589}' | '\u{1fb8b}' => width * 7. / 8.,
+                '\u{258a}' | '\u{1fb8a}' => width * 6. / 8.,
+                '\u{258b}' | '\u{1fb89}' => width * 5. / 8.,
                 '\u{258c}' => width * 4. / 8.,
-                '\u{258d}' => width * 3. / 8.,
-                '\u{258e}' => width * 2. / 8.,
+                '\u{258d}' | '\u{1fb88}' => width * 3. / 8.,
+                '\u{258e}' | '\u{1fb87}' => width * 2. / 8.,
                 '\u{258f}' => width * 1. / 8.,
                 '\u{2590}' => width * 4. / 8.,
                 '\u{2595}' => width * 1. / 8.,
@@ -409,6 +423,11 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                 '\u{2586}' => (height * 6. / 8., height * 6. / 8.),
                 '\u{2587}' => (height * 7. / 8., height * 7. / 8.),
                 '\u{2594}' => (height * 1. / 8., height * 8. / 8.),
+                '\u{1fb82}' => (height * 2. / 8., height * 8. / 8.),
+                '\u{1fb83}' => (height * 3. / 8., height * 8. / 8.),
+                '\u{1fb84}' => (height * 5. / 8., height * 8. / 8.),
+                '\u{1fb85}' => (height * 6. / 8., height * 8. / 8.),
+                '\u{1fb86}' => (height * 7. / 8., height * 8. / 8.),
                 _ => (height, height),
             };
 
@@ -417,12 +436,12 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
 
             // Ensure that resulted glyph will be visible and also round sizes instead of straight
             // flooring them.
-            rect_width = cmp::max(rect_width.round() as i32, 1) as f32;
-            rect_height = cmp::max(rect_height.round() as i32, 1) as f32;
+            rect_width = rect_width.round().max(1.);
+            rect_height = rect_height.round().max(1.);
 
             let x = match character {
                 '\u{2590}' => canvas.x_center(),
-                '\u{2595}' => width - rect_width,
+                '\u{2595}' | '\u{1fb87}'..='\u{1fb8b}' => width - rect_width,
                 _ => 0.,
             };
 
@@ -441,27 +460,30 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
         },
         // Quadrants: '▖', '▗', '▘', '▙', '▚', '▛', '▜', '▝', '▞', '▟'.
         '\u{2596}'..='\u{259F}' => {
+            let x_center = canvas.x_center().round().max(1.);
+            let y_center = canvas.y_center().round().max(1.);
+
             let (w_second, h_second) = match character {
                 '\u{2598}' | '\u{2599}' | '\u{259a}' | '\u{259b}' | '\u{259c}' => {
-                    (canvas.x_center(), canvas.y_center())
+                    (x_center, y_center)
                 },
                 _ => (0., 0.),
             };
             let (w_first, h_first) = match character {
                 '\u{259b}' | '\u{259c}' | '\u{259d}' | '\u{259e}' | '\u{259f}' => {
-                    (canvas.x_center(), canvas.y_center())
+                    (x_center, y_center)
                 },
                 _ => (0., 0.),
             };
             let (w_third, h_third) = match character {
                 '\u{2596}' | '\u{2599}' | '\u{259b}' | '\u{259e}' | '\u{259f}' => {
-                    (canvas.x_center(), canvas.y_center())
+                    (x_center, y_center)
                 },
                 _ => (0., 0.),
             };
             let (w_fourth, h_fourth) = match character {
                 '\u{2597}' | '\u{2599}' | '\u{259a}' | '\u{259c}' | '\u{259f}' => {
-                    (canvas.x_center(), canvas.y_center())
+                    (x_center, y_center)
                 },
                 _ => (0., 0.),
             };
@@ -469,11 +491,94 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
             // Second quadrant.
             canvas.draw_rect(0., 0., w_second, h_second, COLOR_FILL);
             // First quadrant.
-            canvas.draw_rect(canvas.x_center(), 0., w_first, h_first, COLOR_FILL);
+            canvas.draw_rect(x_center, 0., w_first, h_first, COLOR_FILL);
             // Third quadrant.
-            canvas.draw_rect(0., canvas.y_center(), w_third, h_third, COLOR_FILL);
+            canvas.draw_rect(0., y_center, w_third, h_third, COLOR_FILL);
             // Fourth quadrant.
-            canvas.draw_rect(canvas.x_center(), canvas.y_center(), w_fourth, h_fourth, COLOR_FILL);
+            canvas.draw_rect(x_center, y_center, w_fourth, h_fourth, COLOR_FILL);
+        },
+        // Sextants: '🬀', '🬁', '🬂', '🬃', '🬄', '🬅', '🬆', '🬇', '🬈', '🬉', '🬊', '🬋', '🬌', '🬍', '🬎',
+        // '🬏', '🬐', '🬑', '🬒', '🬓', '🬔', '🬕', '🬖', '🬗', '🬘', '🬙', '🬚', '🬛', '🬜', '🬝', '🬞', '🬟',
+        // '🬠', '🬡', '🬢', '🬣', '🬤', '🬥', '🬦', '🬧', '🬨', '🬩', '🬪', '🬫', '🬬', '🬭', '🬮', '🬯', '🬰',
+        // '🬱', '🬲', '🬳', '🬴', '🬵', '🬶', '🬷', '🬸', '🬹', '🬺', '🬻'.
+        '\u{1fb00}'..='\u{1fb3b}' => {
+            let x_center = canvas.x_center().round().max(1.);
+            let y_third = (height as f32 / 3.).round().max(1.);
+            let y_last_third = height as f32 - 2. * y_third;
+
+            let (w_top_left, h_top_left) = match character {
+                '\u{1fb00}' | '\u{1fb02}' | '\u{1fb04}' | '\u{1fb06}' | '\u{1fb08}'
+                | '\u{1fb0a}' | '\u{1fb0c}' | '\u{1fb0e}' | '\u{1fb10}' | '\u{1fb12}'
+                | '\u{1fb15}' | '\u{1fb17}' | '\u{1fb19}' | '\u{1fb1b}' | '\u{1fb1d}'
+                | '\u{1fb1f}' | '\u{1fb21}' | '\u{1fb23}' | '\u{1fb25}' | '\u{1fb27}'
+                | '\u{1fb28}' | '\u{1fb2a}' | '\u{1fb2c}' | '\u{1fb2e}' | '\u{1fb30}'
+                | '\u{1fb32}' | '\u{1fb34}' | '\u{1fb36}' | '\u{1fb38}' | '\u{1fb3a}' => {
+                    (x_center, y_third)
+                },
+                _ => (0., 0.),
+            };
+            let (w_top_right, h_top_right) = match character {
+                '\u{1fb01}' | '\u{1fb02}' | '\u{1fb05}' | '\u{1fb06}' | '\u{1fb09}'
+                | '\u{1fb0a}' | '\u{1fb0d}' | '\u{1fb0e}' | '\u{1fb11}' | '\u{1fb12}'
+                | '\u{1fb14}' | '\u{1fb15}' | '\u{1fb18}' | '\u{1fb19}' | '\u{1fb1c}'
+                | '\u{1fb1d}' | '\u{1fb20}' | '\u{1fb21}' | '\u{1fb24}' | '\u{1fb25}'
+                | '\u{1fb28}' | '\u{1fb2b}' | '\u{1fb2c}' | '\u{1fb2f}' | '\u{1fb30}'
+                | '\u{1fb33}' | '\u{1fb34}' | '\u{1fb37}' | '\u{1fb38}' | '\u{1fb3b}' => {
+                    (x_center, y_third)
+                },
+                _ => (0., 0.),
+            };
+            let (w_mid_left, h_mid_left) = match character {
+                '\u{1fb03}' | '\u{1fb04}' | '\u{1fb05}' | '\u{1fb06}' | '\u{1fb0b}'
+                | '\u{1fb0c}' | '\u{1fb0d}' | '\u{1fb0e}' | '\u{1fb13}' | '\u{1fb14}'
+                | '\u{1fb15}' | '\u{1fb1a}' | '\u{1fb1b}' | '\u{1fb1c}' | '\u{1fb1d}'
+                | '\u{1fb22}' | '\u{1fb23}' | '\u{1fb24}' | '\u{1fb25}' | '\u{1fb29}'
+                | '\u{1fb2a}' | '\u{1fb2b}' | '\u{1fb2c}' | '\u{1fb31}' | '\u{1fb32}'
+                | '\u{1fb33}' | '\u{1fb34}' | '\u{1fb39}' | '\u{1fb3a}' | '\u{1fb3b}' => {
+                    (x_center, y_third)
+                },
+                _ => (0., 0.),
+            };
+            let (w_mid_right, h_mid_right) = match character {
+                '\u{1fb07}' | '\u{1fb08}' | '\u{1fb09}' | '\u{1fb0a}' | '\u{1fb0b}'
+                | '\u{1fb0c}' | '\u{1fb0d}' | '\u{1fb0e}' | '\u{1fb16}' | '\u{1fb17}'
+                | '\u{1fb18}' | '\u{1fb19}' | '\u{1fb1a}' | '\u{1fb1b}' | '\u{1fb1c}'
+                | '\u{1fb1d}' | '\u{1fb26}' | '\u{1fb27}' | '\u{1fb28}' | '\u{1fb29}'
+                | '\u{1fb2a}' | '\u{1fb2b}' | '\u{1fb2c}' | '\u{1fb35}' | '\u{1fb36}'
+                | '\u{1fb37}' | '\u{1fb38}' | '\u{1fb39}' | '\u{1fb3a}' | '\u{1fb3b}' => {
+                    (x_center, y_third)
+                },
+                _ => (0., 0.),
+            };
+            let (w_bottom_left, h_bottom_left) = match character {
+                '\u{1fb0f}' | '\u{1fb10}' | '\u{1fb11}' | '\u{1fb12}' | '\u{1fb13}'
+                | '\u{1fb14}' | '\u{1fb15}' | '\u{1fb16}' | '\u{1fb17}' | '\u{1fb18}'
+                | '\u{1fb19}' | '\u{1fb1a}' | '\u{1fb1b}' | '\u{1fb1c}' | '\u{1fb1d}'
+                | '\u{1fb2d}' | '\u{1fb2e}' | '\u{1fb2f}' | '\u{1fb30}' | '\u{1fb31}'
+                | '\u{1fb32}' | '\u{1fb33}' | '\u{1fb34}' | '\u{1fb35}' | '\u{1fb36}'
+                | '\u{1fb37}' | '\u{1fb38}' | '\u{1fb39}' | '\u{1fb3a}' | '\u{1fb3b}' => {
+                    (x_center, y_last_third)
+                },
+                _ => (0., 0.),
+            };
+            let (w_bottom_right, h_bottom_right) = match character {
+                '\u{1fb1e}' | '\u{1fb1f}' | '\u{1fb20}' | '\u{1fb21}' | '\u{1fb22}'
+                | '\u{1fb23}' | '\u{1fb24}' | '\u{1fb25}' | '\u{1fb26}' | '\u{1fb27}'
+                | '\u{1fb28}' | '\u{1fb29}' | '\u{1fb2a}' | '\u{1fb2b}' | '\u{1fb2c}'
+                | '\u{1fb2d}' | '\u{1fb2e}' | '\u{1fb2f}' | '\u{1fb30}' | '\u{1fb31}'
+                | '\u{1fb32}' | '\u{1fb33}' | '\u{1fb34}' | '\u{1fb35}' | '\u{1fb36}'
+                | '\u{1fb37}' | '\u{1fb38}' | '\u{1fb39}' | '\u{1fb3a}' | '\u{1fb3b}' => {
+                    (x_center, y_last_third)
+                },
+                _ => (0., 0.),
+            };
+
+            canvas.draw_rect(0., 0., w_top_left, h_top_left, COLOR_FILL);
+            canvas.draw_rect(x_center, 0., w_top_right, h_top_right, COLOR_FILL);
+            canvas.draw_rect(0., y_third, w_mid_left, h_mid_left, COLOR_FILL);
+            canvas.draw_rect(x_center, y_third, w_mid_right, h_mid_right, COLOR_FILL);
+            canvas.draw_rect(0., y_third * 2., w_bottom_left, h_bottom_left, COLOR_FILL);
+            canvas.draw_rect(x_center, y_third * 2., w_bottom_right, h_bottom_right, COLOR_FILL);
         },
         _ => unreachable!(),
     }
@@ -491,7 +596,80 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
     }
 }
 
-#[repr(packed)]
+fn powerline_drawing(
+    character: char,
+    metrics: &Metrics,
+    offset: &Delta<i8>,
+) -> Option<RasterizedGlyph> {
+    let height = (metrics.line_height as i32 + offset.y as i32) as usize;
+    let width = (metrics.average_advance as i32 + offset.x as i32) as usize;
+    let extra_thickness = calculate_stroke_size(width) as i32 - 1;
+
+    let mut canvas = Canvas::new(width, height);
+
+    let slope = 1;
+    let top_y = 1;
+    let bottom_y = height as i32 - top_y - 1;
+
+    // Start with offset `1` and draw until the intersection of the f(x) = slope * x + 1 and
+    // g(x) = H - slope * x - 1 lines. The intersection happens when f(x) = g(x), which is at
+    // x = (H - 2) / (2 * slope).
+    let x_intersection = (height as i32 + 1) / 2 - 1;
+
+    // Don't use built-in font if we'd cut the tip too much, for example when the font is really
+    // narrow.
+    if x_intersection - width as i32 > 1 {
+        return None;
+    }
+
+    let top_line = (0..x_intersection).map(|x| line_equation(slope, x, top_y));
+    let bottom_line = (0..x_intersection).map(|x| line_equation(-slope, x, bottom_y));
+
+    // Inner lines to make arrows thicker.
+    let mut top_inner_line = (0..x_intersection - extra_thickness)
+        .map(|x| line_equation(slope, x, top_y + extra_thickness));
+    let mut bottom_inner_line = (0..x_intersection - extra_thickness)
+        .map(|x| line_equation(-slope, x, bottom_y - extra_thickness));
+
+    // NOTE: top_line and bottom_line have the same amount of iterations.
+    for (p1, p2) in top_line.zip(bottom_line) {
+        if character == POWERLINE_TRIANGLE_LTR || character == POWERLINE_TRIANGLE_RTL {
+            canvas.draw_rect(0., p1.1, p1.0 + 1., 1., COLOR_FILL);
+            canvas.draw_rect(0., p2.1, p2.0 + 1., 1., COLOR_FILL);
+        } else if character == POWERLINE_ARROW_LTR || character == POWERLINE_ARROW_RTL {
+            let p3 = top_inner_line.next().unwrap_or(p2);
+            let p4 = bottom_inner_line.next().unwrap_or(p1);
+
+            // If we can't fit the entire arrow in the cell, we cut off the tip of the arrow by
+            // drawing a rectangle between the two lines.
+            if p1.0 as usize + 1 == width {
+                canvas.draw_rect(p1.0, p1.1, 1., p2.1 - p1.1 + 1., COLOR_FILL);
+                break;
+            } else {
+                canvas.draw_rect(p1.0, p1.1, 1., p3.1 - p1.1 + 1., COLOR_FILL);
+                canvas.draw_rect(p4.0, p4.1, 1., p2.1 - p4.1 + 1., COLOR_FILL);
+            }
+        }
+    }
+
+    if character == POWERLINE_TRIANGLE_RTL || character == POWERLINE_ARROW_RTL {
+        canvas.flip_horizontal();
+    }
+
+    let top = height as i32 + metrics.descent as i32;
+    let buffer = BitmapBuffer::Rgb(canvas.into_raw());
+    Some(RasterizedGlyph {
+        character,
+        top,
+        left: 0,
+        height: height as i32,
+        width: width as i32,
+        buffer,
+        advance: (width as i32, height as i32),
+    })
+}
+
+#[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
 struct Pixel {
     _r: u8,
@@ -587,6 +765,16 @@ impl Canvas {
         let end_x = cmp::min((x + stroke_size as f32 / 2.) as i32, self.width as i32) as f32;
 
         (start_x, end_x)
+    }
+
+    /// Flip horizontally.
+    fn flip_horizontal(&mut self) {
+        for row in 0..self.height {
+            for col in 0..self.width / 2 {
+                let index = row * self.width;
+                self.buffer.swap(index + col, index + self.width - col - 1)
+            }
+        }
     }
 
     /// Draws a horizontal straight line from (`x`, `y`) of `size` with the given `stroke_size`.
@@ -696,87 +884,73 @@ impl Canvas {
         }
     }
 
-    /// Draws a part of an ellipse centered in `(0., 0.)` with `self.x_center()` and `self.y_center`
-    /// vertex and co-vertex respectively using a given `stroke` in the bottom-right quadrant of the
-    /// `Canvas` coordinate system.
-    fn draw_ellipse_arc(&mut self, stroke_size: usize) {
-        fn colors_with_error(error: f32, max_transparancy: f32) -> (Pixel, Pixel) {
-            let transparancy = error * max_transparancy;
-            let alpha_1 = 1. - transparancy;
-            let alpha_2 = 1. - (max_transparancy - transparancy);
-            let color_1 = Pixel::gray((COLOR_FILL._r as f32 * alpha_1) as u8);
-            let color_2 = Pixel::gray((COLOR_FILL._r as f32 * alpha_2) as u8);
-            (color_1, color_2)
+    /// Draws a quarter of a circle centered in `(0., self.height - radius)` with radius
+    /// `self.width` and an attached rectangle to form a "╭" using a given `stroke_size` in the
+    /// bottom-right quadrant of the `Canvas` coordinate system.
+    fn draw_rounded_corner(&mut self, stroke_size: usize) {
+        let radius = (self.width.min(self.height) + stroke_size) as f32 / 2.;
+        let stroke_size_f = stroke_size as f32;
+
+        let mut x_offset = 0.;
+        let mut y_offset = 0.;
+        let (long_side, short_side, offset) = if self.height > self.width {
+            (&self.height, &self.width, &mut y_offset)
+        } else {
+            (&self.width, &self.height, &mut x_offset)
+        };
+        let distance_bias = if short_side % 2 == stroke_size % 2 { 0. } else { 0.5 };
+        *offset = *long_side as f32 / 2. - radius + stroke_size_f / 2.;
+        if (self.width % 2 != self.height % 2) && (long_side % 2 == stroke_size % 2) {
+            *offset += 1.;
         }
 
-        let h_line_bounds = self.h_line_bounds(self.y_center(), stroke_size);
-        let v_line_bounds = self.v_line_bounds(self.x_center(), stroke_size);
-        let h_line_bounds = (h_line_bounds.0 as usize, h_line_bounds.1 as usize);
-        let v_line_bounds = (v_line_bounds.0 as usize, v_line_bounds.1 as usize);
-        let max_transparancy = 0.5;
-
-        for (radius_y, radius_x) in (h_line_bounds.0..h_line_bounds.1)
-            .into_iter()
-            .zip((v_line_bounds.0..v_line_bounds.1).into_iter())
-        {
-            let radius_x = radius_x as f32;
-            let radius_y = radius_y as f32;
-            let radius_x2 = radius_x * radius_x;
-            let radius_y2 = radius_y * radius_y;
-            let quarter = f32::round(radius_x2 / f32::sqrt(radius_x2 + radius_y2)) as usize;
-
-            for x in 0..=quarter {
-                let x = x as f32;
-                let y = radius_y * f32::sqrt(1. - x * x / radius_x2);
-                let error = y.fract();
-
-                let (color_1, color_2) = colors_with_error(error, max_transparancy);
-
-                let x = x.clamp(0., radius_x);
-                let y_next = (y + 1.).clamp(0., h_line_bounds.1 as f32 - 1.);
-                let y = y.clamp(0., h_line_bounds.1 as f32 - 1.);
-
-                self.put_pixel(x, y, color_1);
-                self.put_pixel(x, y_next, color_2);
-            }
-
-            let quarter = f32::round(radius_y2 / f32::sqrt(radius_x2 + radius_y2)) as usize;
-            for y in 0..=quarter {
+        let radius_i = (short_side + stroke_size).div_ceil(2);
+        for y in 0..radius_i {
+            for x in 0..radius_i {
                 let y = y as f32;
-                let x = radius_x * f32::sqrt(1. - y * y / radius_y2);
-                let error = x - x.fract();
+                let x = x as f32;
+                let distance = x.hypot(y) + distance_bias;
+                let value = if distance < radius - stroke_size_f - 1. {
+                    // Inside the circle.
+                    0.
+                } else if distance < radius - stroke_size_f {
+                    // On the inner border.
+                    1. + distance - (radius - stroke_size_f)
+                } else if distance < radius - 1. {
+                    // Inside the stroke.
+                    1.
+                } else if distance < radius {
+                    // On the outer border.
+                    radius - distance
+                } else {
+                    // Outside of the circle.
+                    0.
+                };
 
-                let (color_1, color_2) = colors_with_error(error, max_transparancy);
-
-                let x_next = (x + 1.).clamp(0., v_line_bounds.1 as f32 - 1.);
-                let x = x.clamp(0., v_line_bounds.1 as f32 - 1.);
-                let y = y.clamp(0., radius_y);
-
-                self.put_pixel(x, y, color_1);
-                self.put_pixel(x_next, y, color_2);
+                self.put_pixel(
+                    x + x_offset,
+                    y + y_offset,
+                    Pixel::gray((COLOR_FILL._r as f32 * value) as u8),
+                );
             }
         }
 
-        // Ensure the part closer to edges is properly filled.
-        self.draw_h_line(0., self.y_center(), stroke_size as f32, stroke_size);
-        self.draw_v_line(self.x_center(), 0., stroke_size as f32, stroke_size);
-
-        // Fill the resulted arc, since it could have gaps in-between.
-        for y in 0..self.height {
-            let row = y * self.width;
-            let left = match self.buffer[row..row + self.width].iter().position(|p| p._r != 0) {
-                Some(left) => row + left,
-                _ => continue,
-            };
-            let right = match self.buffer[row..row + self.width].iter().rposition(|p| p._r != 0) {
-                Some(right) => row + right,
-                _ => continue,
-            };
-
-            for index in left + 1..right {
-                self.buffer[index] =
-                    self.buffer[index] + self.buffer[index - 1] / 2 + self.buffer[index + 1] / 2;
-            }
+        if self.height > self.width {
+            self.draw_rect(
+                self.x_center() - stroke_size_f * 0.5,
+                0.,
+                stroke_size_f,
+                y_offset,
+                COLOR_FILL,
+            );
+        } else {
+            self.draw_rect(
+                0.,
+                self.y_center() - stroke_size_f * 0.5,
+                x_offset,
+                stroke_size_f,
+                COLOR_FILL,
+            );
         }
     }
 
@@ -799,34 +973,60 @@ impl Canvas {
     }
 }
 
+/// Compute line width.
+fn calculate_stroke_size(cell_width: usize) -> usize {
+    // Use one eight of the cell width, since this is used as a step size for block elements.
+    cmp::max((cell_width as f32 / 8.).round() as usize, 1)
+}
+
+/// `f(x) = slope * x + offset` equation.
+fn line_equation(slope: i32, x: i32, offset: i32) -> (f32, f32) {
+    (x as f32, (slope * x + offset) as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossfont::Metrics;
 
+    // Dummy metrics values to test builtin glyphs coverage.
+    const METRICS: Metrics = Metrics {
+        average_advance: 6.,
+        line_height: 16.,
+        descent: 4.,
+        underline_position: 2.,
+        underline_thickness: 2.,
+        strikeout_position: 2.,
+        strikeout_thickness: 2.,
+    };
+
     #[test]
     fn builtin_line_drawing_glyphs_coverage() {
-        // Dummy metrics values to test built-in glyphs coverage.
-        let metrics = Metrics {
-            average_advance: 6.,
-            line_height: 16.,
-            descent: 4.,
-            underline_position: 2.,
-            underline_thickness: 2.,
-            strikeout_position: 2.,
-            strikeout_thickness: 2.,
-        };
-
         let offset = Default::default();
         let glyph_offset = Default::default();
 
         // Test coverage of box drawing characters.
-        for character in '\u{2500}'..='\u{259f}' {
-            assert!(builtin_glyph(character, &metrics, &offset, &glyph_offset).is_some());
+        for character in ('\u{2500}'..='\u{259f}').chain('\u{1fb00}'..='\u{1fb3b}') {
+            assert!(builtin_glyph(character, &METRICS, &offset, &glyph_offset).is_some());
         }
 
         for character in ('\u{2450}'..'\u{2500}').chain('\u{25a0}'..'\u{2600}') {
-            assert!(builtin_glyph(character, &metrics, &offset, &glyph_offset).is_none());
+            assert!(builtin_glyph(character, &METRICS, &offset, &glyph_offset).is_none());
+        }
+    }
+
+    #[test]
+    fn builtin_powerline_glyphs_coverage() {
+        let offset = Default::default();
+        let glyph_offset = Default::default();
+
+        // Test coverage of box drawing characters.
+        for character in '\u{e0b0}'..='\u{e0b3}' {
+            assert!(builtin_glyph(character, &METRICS, &offset, &glyph_offset).is_some());
+        }
+
+        for character in ('\u{e0a0}'..'\u{e0b0}').chain('\u{e0b4}'..'\u{e0c0}') {
+            assert!(builtin_glyph(character, &METRICS, &offset, &glyph_offset).is_none());
         }
     }
 }

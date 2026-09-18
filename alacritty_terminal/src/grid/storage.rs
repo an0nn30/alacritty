@@ -1,8 +1,9 @@
-use std::cmp::{max, PartialEq};
+use std::cmp::max;
 use std::mem;
 use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut};
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use super::Row;
@@ -27,7 +28,8 @@ const MAX_CACHE_SIZE: usize = 1_000;
 /// [`slice::rotate_left`]: https://doc.rust-lang.org/std/primitive.slice.html#method.rotate_left
 /// [`Deref`]: std::ops::Deref
 /// [`zero`]: #structfield.zero
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Storage<T> {
     inner: Vec<Row<T>>,
 
@@ -64,7 +66,7 @@ impl<T> Storage<T> {
     #[inline]
     pub fn with_capacity(visible_lines: usize, columns: usize) -> Storage<T>
     where
-        T: Clone + Default,
+        T: Default,
     {
         // Initialize visible lines; the scrollback buffer is initialized dynamically.
         let mut inner = Vec::with_capacity(visible_lines);
@@ -77,13 +79,13 @@ impl<T> Storage<T> {
     #[inline]
     pub fn grow_visible_lines(&mut self, next: usize)
     where
-        T: Clone + Default,
+        T: Default,
     {
         // Number of lines the buffer needs to grow.
-        let growage = next - self.visible_lines;
+        let additional_lines = next - self.visible_lines;
 
         let columns = self[Line(0)].len();
-        self.initialize(growage, columns);
+        self.initialize(additional_lines, columns);
 
         // Update visible lines.
         self.visible_lines = next;
@@ -123,7 +125,7 @@ impl<T> Storage<T> {
     #[inline]
     pub fn initialize(&mut self, additional_rows: usize, columns: usize)
     where
-        T: Clone + Default,
+        T: Default,
     {
         if self.len + additional_rows > self.inner.len() {
             self.rezero();
@@ -228,11 +230,7 @@ impl<T> Storage<T> {
         //
         // Requires `zeroed` to be smaller than `self.inner.len() * 2`,
         // but both `self.zero` and `requested` are always smaller than `self.inner.len()`.
-        if zeroed >= self.inner.len() {
-            zeroed - self.inner.len()
-        } else {
-            zeroed
-        }
+        if zeroed >= self.inner.len() { zeroed - self.inner.len() } else { zeroed }
     }
 
     /// Rotate the ringbuffer to reset `self.zero` back to index `0`.
@@ -267,9 +265,9 @@ impl<T> IndexMut<Line> for Storage<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::grid::row::Row;
-    use crate::grid::storage::{Storage, MAX_CACHE_SIZE};
     use crate::grid::GridCell;
+    use crate::grid::row::Row;
+    use crate::grid::storage::{MAX_CACHE_SIZE, Storage};
     use crate::index::{Column, Line};
     use crate::term::cell::Flags;
 

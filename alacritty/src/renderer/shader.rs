@@ -30,11 +30,14 @@ impl ShaderVersion {
 impl ShaderProgram {
     pub fn new(
         shader_version: ShaderVersion,
+        shader_header: Option<&str>,
         vertex_shader: &'static str,
         fragment_shader: &'static str,
     ) -> Result<Self, ShaderError> {
-        let vertex_shader = Shader::new(shader_version, gl::VERTEX_SHADER, vertex_shader)?;
-        let fragment_shader = Shader::new(shader_version, gl::FRAGMENT_SHADER, fragment_shader)?;
+        let vertex_shader =
+            Shader::new(shader_version, shader_header, gl::VERTEX_SHADER, vertex_shader)?;
+        let fragment_shader =
+            Shader::new(shader_version, shader_header, gl::FRAGMENT_SHADER, fragment_shader)?;
 
         let program = unsafe { Self(gl::CreateProgram()) };
 
@@ -82,12 +85,23 @@ struct Shader(GLuint);
 impl Shader {
     fn new(
         shader_version: ShaderVersion,
+        shader_header: Option<&str>,
         kind: GLenum,
         source: &'static str,
     ) -> Result<Self, ShaderError> {
-        let header = shader_version.shader_header();
-        let len: [GLint; 2] = [header.len() as GLint, source.len() as GLint];
-        let source = [header.as_ptr() as *const _, source.as_ptr() as *const _];
+        let version_header = shader_version.shader_header();
+        let mut sources = Vec::<*const GLchar>::with_capacity(3);
+        let mut lengths = Vec::<GLint>::with_capacity(3);
+        sources.push(version_header.as_ptr().cast());
+        lengths.push(version_header.len() as GLint);
+
+        if let Some(shader_header) = shader_header {
+            sources.push(shader_header.as_ptr().cast());
+            lengths.push(shader_header.len() as GLint);
+        }
+
+        sources.push(source.as_ptr().cast());
+        lengths.push(source.len() as GLint);
 
         let shader = unsafe { Self(gl::CreateShader(kind)) };
 
@@ -95,9 +109,9 @@ impl Shader {
         unsafe {
             gl::ShaderSource(
                 shader.id(),
-                len.len() as GLint,
-                source.as_ptr() as *const _,
-                len.as_ptr(),
+                lengths.len() as GLint,
+                sources.as_ptr().cast(),
+                lengths.as_ptr(),
             );
             gl::CompileShader(shader.id());
             gl::GetShaderiv(shader.id(), gl::COMPILE_STATUS, &mut success);
@@ -182,9 +196,9 @@ impl std::error::Error for ShaderError {}
 impl fmt::Display for ShaderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Compile(reason) => write!(f, "Failed compiling shader: {}", reason),
-            Self::Link(reason) => write!(f, "Failed linking shader: {}", reason),
-            Self::Uniform(name) => write!(f, "Failed to get uniform location of {:?}", name),
+            Self::Compile(reason) => write!(f, "Failed compiling shader: {reason}"),
+            Self::Link(reason) => write!(f, "Failed linking shader: {reason}"),
+            Self::Uniform(name) => write!(f, "Failed to get uniform location of {name:?}"),
         }
     }
 }

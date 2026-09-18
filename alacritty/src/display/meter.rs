@@ -57,18 +57,13 @@ impl<'a> Sampler<'a> {
     }
 }
 
-impl<'a> Drop for Sampler<'a> {
+impl Drop for Sampler<'_> {
     fn drop(&mut self) {
         self.meter.add_sample(self.alive_duration());
     }
 }
 
 impl Meter {
-    /// Create a meter.
-    pub fn new() -> Meter {
-        Default::default()
-    }
-
     /// Get a sampler.
     pub fn sampler(&mut self) -> Sampler<'_> {
         Sampler::new(self)

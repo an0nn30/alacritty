@@ -3,11 +3,12 @@
 use std::cmp::{max, min};
 use std::ops::{Bound, Deref, Index, IndexMut, Range, RangeBounds};
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::ansi::{CharsetIndex, StandardCharset};
 use crate::index::{Column, Line, Point};
 use crate::term::cell::{Flags, ResetDiscriminant};
+use crate::vte::ansi::{CharsetIndex, StandardCharset};
 
 pub mod resize;
 mod row;
@@ -104,14 +105,15 @@ pub enum Scroll {
 ///                           ^
 ///                        columns
 /// ```
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Grid<T> {
     /// Current cursor for writing data.
-    #[serde(skip)]
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub cursor: Cursor<T>,
 
     /// Last saved cursor.
-    #[serde(skip)]
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub saved_cursor: Cursor<T>,
 
     /// Lines in the grid. Each row holds a list of cells corresponding to the
@@ -135,7 +137,7 @@ pub struct Grid<T> {
     max_scroll_limit: usize,
 }
 
-impl<T: GridCell + Default + PartialEq + Clone> Grid<T> {
+impl<T: GridCell + Default + PartialEq> Grid<T> {
     pub fn new(lines: usize, columns: usize, max_scroll_limit: usize) -> Grid<T> {
         Grid {
             raw: Storage::with_capacity(lines, columns),
@@ -266,33 +268,41 @@ impl<T: GridCell + Default + PartialEq + Clone> Grid<T> {
             self.display_offset = min(self.display_offset + positions, self.max_scroll_limit);
         }
 
-        // Create scrollback for the new lines.
-        self.increase_scroll_limit(positions);
+        // Only rotate the entire history if the active region starts at the top.
+        if region.start == 0 {
+            // Create scrollback for the new lines.
+            self.increase_scroll_limit(positions);
 
-        // Swap the lines fixed at the top to their target positions after rotation.
-        //
-        // Since we've made sure that the rotation will never rotate away the entire region, we
-        // know that the position of the fixed lines before the rotation must already be
-        // visible.
-        //
-        // We need to start from the bottom, to make sure the fixed lines aren't swapped with each
-        // other.
-        for i in (0..region.start.0).rev().map(Line::from) {
-            self.raw.swap(i, i + positions);
+            // Swap the lines fixed at the top to their target positions after rotation.
+            //
+            // Since we've made sure that the rotation will never rotate away the entire region, we
+            // know that the position of the fixed lines before the rotation must already be
+            // visible.
+            //
+            // We need to start from the bottom, to make sure the fixed lines aren't swapped with
+            // each other.
+            for i in (0..region.start.0).rev().map(Line::from) {
+                self.raw.swap(i, i + positions);
+            }
+
+            // Rotate the entire line buffer upward.
+            self.raw.rotate(-(positions as isize));
+
+            // Swap the fixed lines at the bottom back into position.
+            let screen_lines = self.screen_lines() as i32;
+            for i in (region.end.0..screen_lines).rev().map(Line::from) {
+                self.raw.swap(i, i - positions);
+            }
+        } else {
+            // Rotate lines without moving anything into history.
+            for i in (region.start.0..region.end.0 - positions as i32).map(Line::from) {
+                self.raw.swap(i, i + positions);
+            }
         }
-
-        // Rotate the entire line buffer upward.
-        self.raw.rotate(-(positions as isize));
 
         // Ensure all new lines are fully cleared.
-        let screen_lines = self.screen_lines();
-        for i in ((screen_lines - positions)..screen_lines).map(Line::from) {
+        for i in (region.end.0 - positions as i32..region.end.0).map(Line::from) {
             self.raw[i].reset(&self.cursor.template);
-        }
-
-        // Swap the fixed lines at the bottom back into position.
-        for i in (region.end.0..(screen_lines as i32)).rev().map(Line::from) {
-            self.raw.swap(i, i - positions);
         }
     }
 
@@ -346,7 +356,7 @@ impl<T> Grid<T> {
     /// Reset a visible region within the grid.
     pub fn reset_region<D, R: RangeBounds<Line>>(&mut self, bounds: R)
     where
-        T: ResetDiscriminant<D> + GridCell + Clone + Default,
+        T: ResetDiscriminant<D> + GridCell + Default,
         D: PartialEq,
     {
         let start = match bounds.start_bound() {
@@ -382,7 +392,7 @@ impl<T> Grid<T> {
     #[inline]
     pub fn initialize_all(&mut self)
     where
-        T: GridCell + Clone + Default,
+        T: GridCell + Default,
     {
         // Remove all cached lines to clear them of any content.
         self.truncate();
@@ -568,12 +578,12 @@ pub struct GridIterator<'a, T> {
 }
 
 impl<'a, T> GridIterator<'a, T> {
-    /// Current iteratior position.
+    /// Current iterator position.
     pub fn point(&self) -> Point {
         self.point
     }
 
-    /// Cell at the current iteratior position.
+    /// Cell at the current iterator position.
     pub fn cell(&self) -> &'a T {
         &self.grid[self.point]
     }
@@ -589,7 +599,7 @@ impl<'a, T> Iterator for GridIterator<'a, T> {
         }
 
         match self.point {
-            Point { column, .. } if column == self.grid.last_column() => {
+            Point { column, .. } if column >= self.grid.last_column() => {
                 self.point.column = Column(0);
                 self.point.line += 1;
             },
@@ -598,6 +608,24 @@ impl<'a, T> Iterator for GridIterator<'a, T> {
 
         Some(Indexed { cell: &self.grid[self.point], point: self.point })
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.point >= self.end {
+            return (0, Some(0));
+        }
+
+        let size = if self.point.line == self.end.line {
+            (self.end.column - self.point.column).0
+        } else {
+            let cols_on_first_line = self.grid.columns.saturating_sub(self.point.column.0 + 1);
+            let middle_lines = (self.end.line - self.point.line).0 as usize - 1;
+            let cols_on_last_line = self.end.column + 1;
+
+            cols_on_first_line + middle_lines * self.grid.columns + cols_on_last_line.0
+        };
+
+        (size, Some(size))
+    }
 }
 
 /// Bidirectional iterator.
@@ -605,13 +633,13 @@ pub trait BidirectionalIterator: Iterator {
     fn prev(&mut self) -> Option<Self::Item>;
 }
 
-impl<'a, T> BidirectionalIterator for GridIterator<'a, T> {
+impl<T> BidirectionalIterator for GridIterator<'_, T> {
     fn prev(&mut self) -> Option<Self::Item> {
         let topmost_line = self.grid.topmost_line();
         let last_column = self.grid.last_column();
 
         // Stop once we've reached the end of the grid.
-        if self.point == Point::new(topmost_line, Column(0)) {
+        if self.point <= Point::new(topmost_line, Column(0)) {
             return None;
         }
 
